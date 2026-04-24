@@ -54,7 +54,8 @@ contract PaymentHub {
     // Version 7: added sell against eth and erc20, version, add permitinfo/swapinfo struct
     // Version 8: use SafeERC20 for transfers
     // Version 9: change payFromEther to include a swap path
-    uint256 public constant VERSION = 9;
+    // Version 10: added checkAmount to prevent underpayment of shares, removed keep ether
+    uint256 public constant VERSION = 10;
 
     uint256 private constant KEEP_ETHER = 0x4; // copied from brokerbot
 
@@ -92,6 +93,8 @@ contract PaymentHub {
     /// @param amountBase Required amount.
     /// @param swappedAmount Swapped amount.
     error PaymentHub_SwapError(uint256 amountBase, uint256 swappedAmount);
+
+    error InsufficientPayment(uint256 required, uint256 provided);
 
     constructor(address _trustedForwarder, IQuoter _quoter, ISwapRouter swapRouter, AggregatorV3Interface _aggregatorCHFUSD, AggregatorV3Interface _aggregatorETHUSD) {
         trustedForwarder = _trustedForwarder;
@@ -295,7 +298,14 @@ contract PaymentHub {
 
     function payAndNotify(IERC20 token, IBrokerbot brokerbot, uint256 amount, bytes calldata ref) public returns (uint256) {
         token.safeTransferFrom(msg.sender, address(brokerbot), amount);
-        return brokerbot.processIncoming(token, msg.sender, amount, ref);
+        uint256 shares = brokerbot.processIncoming(token, msg.sender, amount, ref);
+        checkAmount(brokerbot, shares, amount);
+        return shares;
+    }
+
+    function checkAmount(IBrokerbot brokerbot, uint256 shares, uint256 paid) internal view {
+        uint256 price = brokerbot.getSellPrice(shares);
+        if (price > paid) revert InsufficientPayment(price, paid);
     }
 
     /**
@@ -309,28 +319,15 @@ contract PaymentHub {
      */
     function payFromEtherAndNotify(IBrokerbot brokerbot, uint256 amountBase, bytes calldata ref, bytes memory path) external payable returns (uint256 priceInEther, uint256 sharesOut) {
         IERC20 base = brokerbot.base();
-        // Check if the brokerbot has setting to keep ETH
-        if (hasSettingKeepEther(brokerbot)) {
-            priceInEther = getPriceInEtherFromOracle(amountBase, base);
-            sharesOut = brokerbot.processIncoming{value: priceInEther}(base, msg.sender, amountBase, ref);
-
-            // Pay back ETH that was overpaid
-            if (priceInEther < msg.value) {
-                (bool success, ) = msg.sender.call{value:msg.value - priceInEther}(""); // return change
-                if (!success) {
-                    revert PaymentHub_TransferFailed();
-                }
-            }
-
-        } else {
-            uint256 balanceBefore = IERC20(base).balanceOf(address(brokerbot));
-            priceInEther = payFromEther(address(brokerbot), amountBase, path);
-            uint256 balanceAfter = IERC20(base).balanceOf(address(brokerbot));
-            if (amountBase != (balanceAfter - balanceBefore)) { // check that the swap was successful with correct currency
-                revert PaymentHub_SwapError(amountBase, balanceAfter - balanceBefore);
-            }    
-            sharesOut = brokerbot.processIncoming(base, msg.sender, amountBase, ref); // not sending msg.value as this is already done in payFromEther function
-        }
+       
+        uint256 balanceBefore = IERC20(base).balanceOf(address(brokerbot));
+        priceInEther = payFromEther(address(brokerbot), amountBase, path);
+        uint256 balanceAfter = IERC20(base).balanceOf(address(brokerbot));
+        if (amountBase != (balanceAfter - balanceBefore)) { // check that the swap was successful with correct currency
+            revert PaymentHub_SwapError(amountBase, balanceAfter - balanceBefore);
+        }    
+        sharesOut = brokerbot.processIncoming(base, msg.sender, amountBase, ref); // not sending msg.value as this is already done in payFromEther function
+        checkAmount(brokerbot, sharesOut, amountBase);
     }
 
     /***
@@ -353,7 +350,8 @@ contract PaymentHub {
         if (amountBase != (balanceAfter - balanceBefore)) {
             revert PaymentHub_SwapError(amountBase, balanceAfter - balanceBefore);
         }        
-        amountOut = brokerbot.processIncoming(base, msg.sender, balanceAfter - balanceBefore, ref);
+        amountOut = brokerbot.processIncoming(base, msg.sender, amountBase, ref);
+        checkAmount(brokerbot, amountOut, amountBase);
     }
 
     /**
