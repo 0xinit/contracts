@@ -31,17 +31,13 @@ import "../utils/Address.sol";
 import "../ERC20/IERC20.sol";
 import "../ERC20/IERC20Permit.sol";
 import "./IUniswapV3.sol";
-import "../utils/Ownable.sol";
 import "./IBrokerbot.sol";
-import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import "../utils/SafeERC20.sol";
 
 /**
  * A hub for payments. This allows tokens that do not support ERC 677 to enjoy similar functionality,
  * namely interacting with a token-handling smart contract in one transaction, without having to set an allowance first.
  * Instead, an allowance needs to be set only once, namely for this contract.
- * Further, it supports automatic conversion from Ether to the payment currency through Uniswap or the reception of Ether
- * using the current exchange rate as found in the chainlink oracle.
  */
 contract PaymentHub {
 
@@ -55,31 +51,12 @@ contract PaymentHub {
     // Version 8: use SafeERC20 for transfers
     // Version 9: change payFromEther to include a swap path
     // Version 10: added checkAmount to prevent underpayment of shares, removed keep ether
-    uint256 public constant VERSION = 10;
-
-    uint256 private constant KEEP_ETHER = 0x4; // copied from brokerbot
-
-    uint256 private constant DENOMINATOR = 1e8;
-    address private constant XCHF_TOKEN = 0xB4272071eCAdd69d933AdcD19cA99fe80664fc08;
-    address private constant ZCHF_TOKEN = 0xB58E61C3098d85632Df34EecfB899A1Ed80921cB;
+    // Version 11: removed all keep ether logic an oracles, removed forwarder and permit logic
+    // Version 12: compiled with solidity 0.8.34
+    uint256 public constant VERSION = 12;
 
     IQuoter private immutable uniswapQuoter;
     ISwapRouter private immutable uniswapRouter;
-    AggregatorV3Interface internal immutable priceFeedCHFUSD;
-    AggregatorV3Interface internal immutable priceFeedETHUSD;
-
-    address public trustedForwarder;
-
-    struct PermitInfo {
-        uint256 exFee;
-        uint256 deadline;
-        uint8 v;
-        bytes32 r;
-        bytes32 s;
-    }
-
-    // event to when new forwarder is set
-    event ForwarderChanged(address indexed _oldForwarder, address indexed _newForwarder);
 
 	/*//////////////////////////////////////////////////////////////
                             Custom errors
@@ -96,35 +73,9 @@ contract PaymentHub {
 
     error InsufficientPayment(uint256 required, uint256 provided);
 
-    constructor(address _trustedForwarder, IQuoter _quoter, ISwapRouter swapRouter, AggregatorV3Interface _aggregatorCHFUSD, AggregatorV3Interface _aggregatorETHUSD) {
-        trustedForwarder = _trustedForwarder;
+    constructor(IQuoter _quoter, ISwapRouter swapRouter) {
         uniswapQuoter = _quoter;
         uniswapRouter = swapRouter;
-        priceFeedCHFUSD = _aggregatorCHFUSD;
-        priceFeedETHUSD = _aggregatorETHUSD;
-    }
-
-    modifier onlySellerAndForwarder(address seller) {
-        if (msg.sender != trustedForwarder && msg.sender != seller) {
-            revert PaymentHub_InvalidSender(msg.sender);
-        }
-        _;
-    }
-
-    modifier onlyForwarder() {
-        if (msg.sender != trustedForwarder) {
-            revert PaymentHub_InvalidSender(msg.sender);
-        }
-        _;
-    }
-
-    /**
-     * @notice Change the trusted forwarder.
-     * @param newForwarder The new trusted forwarder.
-     */
-     function changeForwarder(address newForwarder) external onlyForwarder {
-        trustedForwarder = newForwarder;
-        emit ForwarderChanged(msg.sender, newForwarder);
     }
 
     /**  
@@ -156,47 +107,6 @@ contract PaymentHub {
                 amount
             );
         }
-    }
-
-    /**
-     * Get price in Ether depding on brokerbot setting.
-     * If keep ETH is set price is from oracle.
-     * This is the method that the Brokerbot widget should use to quote the price to the user.
-     * @return The price in wei.
-     */
-    function getPriceInEther(uint256 amountInBase, IBrokerbot brokerBot, bytes calldata path) public returns (uint256) {
-        if ((address(brokerBot) != address(0)) && hasSettingKeepEther(brokerBot)) {
-            return getPriceInEtherFromOracle(amountInBase, IBrokerbot(brokerBot).base());
-        } else {
-            return getPriceERC20(amountInBase, path, true);
-        }
-    }
-
-    /**
-     * Price in ETH with 18 decimals
-     */
-    function getPriceInEtherFromOracle(uint256 amountInBase, IERC20 base) public view returns (uint256) {
-        if(address(base) == XCHF_TOKEN || address(base) == ZCHF_TOKEN) {
-            return getLatestPriceCHFUSD() * amountInBase / getLatestPriceETHUSD();
-        } else {
-            return amountInBase * DENOMINATOR / getLatestPriceETHUSD();
-        }
-    }
-
-    /**
-     * Returns the latest price of eth/usd pair from chainlink with 8 decimals
-     */
-    function getLatestPriceETHUSD() public view returns (uint256) {
-        (, int256 price, , , ) = priceFeedETHUSD.latestRoundData();
-        return uint256(price);
-    }
-
-    /**
-     * Returns the latest price of chf/usd pair from chainlink with 8 decimals
-     */
-    function getLatestPriceCHFUSD() public view returns (uint256) {
-        (, int256 price, , , ) = priceFeedCHFUSD.latestRoundData();
-        return uint256(price);
     }
 
     /**
@@ -354,6 +264,16 @@ contract PaymentHub {
         checkAmount(brokerbot, amountOut, amountBase);
     }
 
+    error SellWithPermitDisabled();
+
+    struct PermitInfo {
+        uint256 exFee;
+        uint256 deadline;
+        uint8 v;
+        bytes32 r;
+        bytes32 s;
+    }
+
     /**
      * @notice Sell shares with permit
      * @param brokerbot The brokerbot to recive the shares.
@@ -364,19 +284,9 @@ contract PaymentHub {
      * @param permitInfo Information about the permit.
      * @return The base currency amount for the selling of the shares.
      */
-    function sellSharesWithPermit(IBrokerbot brokerbot, IERC20Permit shares, address seller, address recipient, uint256 amountToSell, bytes calldata ref, PermitInfo calldata permitInfo) public onlySellerAndForwarder(seller) returns (uint256) {
+    function sellSharesWithPermit(IBrokerbot brokerbot, IERC20Permit shares, address seller, address recipient, uint256 amountToSell, bytes calldata ref, PermitInfo calldata permitInfo) public returns (uint256) {
         // Call permit to set allowance
-        shares.permit(seller, address(this), amountToSell, permitInfo.deadline, permitInfo.v, permitInfo.r,permitInfo.s);
-        // process sell
-        if (permitInfo.exFee > 0){
-            uint256 proceeds = _sellShares(brokerbot, shares, seller, address(this), amountToSell, ref);
-            IERC20 currency = brokerbot.base();
-            currency.safeTransfer(msg.sender, permitInfo.exFee);
-            currency.safeTransfer(recipient, proceeds - permitInfo.exFee);
-            return proceeds - permitInfo.exFee;
-        } else {
-            return _sellShares(brokerbot, shares, seller, recipient, amountToSell, ref);
-        }
+        revert SellWithPermitDisabled();
     }
 
     /**
@@ -390,9 +300,8 @@ contract PaymentHub {
      * @param params Information about the swap.
      * @return The output amount of the swap to the desired token.
      */
-    function sellSharesWithPermitAndSwap(IBrokerbot brokerbot, IERC20Permit shares, address seller,  uint256 amountToSell, bytes calldata ref, PermitInfo calldata permitInfo, ISwapRouter.ExactInputParams memory params, bool unwrapWeth) external onlySellerAndForwarder(seller) returns (uint256) {
-        params.amountIn = sellSharesWithPermit(brokerbot, shares, seller, address(this), amountToSell, ref, permitInfo);
-        return _swap(params, unwrapWeth);
+    function sellSharesWithPermitAndSwap(IBrokerbot brokerbot, IERC20Permit shares, address seller,  uint256 amountToSell, bytes calldata ref, PermitInfo calldata permitInfo, ISwapRouter.ExactInputParams memory params, bool unwrapWeth) external returns (uint256) {
+        revert SellWithPermitDisabled();
     }
 
     /**
@@ -460,29 +369,8 @@ contract PaymentHub {
     /**
      * Checks if the brokerbot has setting enabled to keep ether
      */
-    function hasSettingKeepEther(IBrokerbot brokerbot) public view returns (bool) {
-        return brokerbot.settings() & KEEP_ETHER == KEEP_ETHER;
-    }
-
-    /**
-     * @notice In case tokens have been accidentally sent directly to this contract. Only Forwarder can withdraw, else a MEV bot will intercept it.
-     * @param ercAddress The erc20 address.
-     * @param to The address to transfer tokens to.
-     * @param amount The amount of tokens to transfer.
-     */
-    function recover(IERC20 ercAddress, address to, uint256 amount) external onlyForwarder {
-        ercAddress.safeTransfer(to, amount);
-    }
-
-    /**
-     * @notice Transfer ether to a given address. Only Forwarder can withdraw, else a MEV bot will intercept it.
-     * @param to The address to transfer ether to.
-     */
-    function withdrawEther(address to, uint256 amount) external onlyForwarder {
-        (bool success, ) = payable(to).call{value:amount}("");
-        if (!success) {
-            revert PaymentHub_TransferFailed();
-        }
+    function hasSettingKeepEther(IBrokerbot brokerbot) public pure returns (bool) {
+        return false;
     }
 
     /**

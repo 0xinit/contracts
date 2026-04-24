@@ -232,7 +232,7 @@ contract Brokerbot is IBrokerbot, Ownable {
         while (min < max){
             uint256 middle = (min + max + 1)/2;
             uint256 totalPrice = getPrice(currentPrice, middle);
-            if (money > totalPrice){
+            if (money >= totalPrice){
                 min = middle;
             } else {
                 max = middle - 1;
